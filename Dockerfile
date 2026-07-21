@@ -2,9 +2,9 @@ FROM mcr.microsoft.com/playwright:v1.52.0-jammy
 
 WORKDIR /app
 
-# Copy package files and install dependencies
-COPY package*.json ./
-RUN npm ci --only=production
+# Copy package files and install dependencies (use npm install since no lockfile)
+COPY package.json ./
+RUN npm install --omit=dev
 
 # Copy application code
 COPY . .
