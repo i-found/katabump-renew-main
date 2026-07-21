@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "node-cron": "^3.0.3",
-    "playwright": "1.61.1"
+    "playwright": "1.61.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   }
 }

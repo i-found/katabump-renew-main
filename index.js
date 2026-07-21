@@ -5,9 +5,13 @@
  * 获取 4 天使用权限。通过 Telegram Bot 推送续期结果通知。
  */
 
-const { chromium } = require("playwright");
+const { chromium } = require("playwright-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
 const cron = require("node-cron");
 const http = require("http");
+
+// 挂载隐身插件 — 绕过 Cloudflare / Turnstile 的自动化检测
+chromium.use(StealthPlugin());
 
 // ============================================================
 // 配置 — 全部通过 Railway 环境变量注入
@@ -196,20 +200,20 @@ const ALTCHA_SOLVED_JS = `(() => {
 })()`;
 
 // ============================================================
-// 浏览器启动 & 隐身配置
+// 浏览器启动 & 隐身配置（playwright-extra + stealth plugin）
 // ============================================================
 async function launchBrowser() {
-  logger.info("启动 Chromium 浏览器...");
+  logger.info("启动 Chromium 浏览器（隐身模式）...");
   const browser = await chromium.launch({
     headless: true,
     args: [
-      "--disable-blink-features=AutomationControlled",
       "--no-sandbox",
       "--disable-setuid-sandbox",
-      "--disable-infobars",
       "--disable-dev-shm-usage",
-      "--disable-web-security",
+      "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
+      "--disable-web-security",
+      "--disable-gpu",
       "--window-size=1920,1080",
     ],
   });
@@ -220,43 +224,19 @@ async function launchBrowser() {
     viewport: { width: 1920, height: 1080 },
     locale: "en-US",
     timezoneId: "Asia/Shanghai",
-    permissions: [],
+    permissions: ["geolocation"],
+    geolocation: { latitude: 31.2304, longitude: 121.4737 }, // 上海坐标
   });
 
-  // 页面初始化前注入隐身脚本
+  // stealth plugin 已处理大部分指纹，这里补强 WebGL 和 hardwareConcurrency
   await context.addInitScript(() => {
-    // 隐藏 webdriver 标记
-    Object.defineProperty(navigator, "webdriver", { get: () => false });
-    // 伪装 plugins 数量
-    Object.defineProperty(navigator, "plugins", {
-      get: () => [1, 2, 3, 4, 5],
+    // 伪装硬件并发数
+    Object.defineProperty(navigator, "hardwareConcurrency", {
+      get: () => 8,
     });
-    // 伪装 languages
-    Object.defineProperty(navigator, "languages", {
-      get: () => ["en-US", "en", "zh-CN"],
-    });
-    // 伪装 platform
-    Object.defineProperty(navigator, "platform", {
-      get: () => "Win32",
-    });
-    // 覆盖 chrome 对象
-    window.chrome = {
-      runtime: {},
-      loadTimes: () => {},
-      csi: () => {},
-      app: {},
-    };
-    // 覆盖权限查询
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) =>
-      parameters.name === "notifications"
-        ? Promise.resolve({ state: Notification.permission })
-        : originalQuery(parameters);
-    // 防止 iframe 检测
-    Object.defineProperty(HTMLIFrameElement.prototype, "contentWindow", {
-      get: function () {
-        return window;
-      },
+    // 伪装设备内存
+    Object.defineProperty(navigator, "deviceMemory", {
+      get: () => 8,
     });
   });
 
@@ -291,11 +271,11 @@ async function jsFillInput(page, selector, text) {
 }
 
 // ============================================================
-// 处理 Cloudflare Turnstile 验证
+// 处理 Cloudflare Turnstile 验证（改进版）
 // ============================================================
 async function handleTurnstile(page) {
   logger.step("处理 Cloudflare Turnstile 验证...");
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(3000);
 
   // 检查是否已静默通过
   if (await page.evaluate(SOLVED_JS)) {
@@ -309,16 +289,64 @@ async function handleTurnstile(page) {
     await page.waitForTimeout(500);
   }
 
-  // 尝试最多 6 次点击验证
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // 最多尝试 4 次（每次等待更长时间）
+  for (let attempt = 0; attempt < 4; attempt++) {
     if (await page.evaluate(SOLVED_JS)) {
-      logger.success(`Turnstile 通过（第 ${attempt} 次尝试）`);
+      logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试）`);
       return true;
     }
 
-    logger.info(`第 ${attempt + 1} 次点击 Turnstile...`);
+    logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 查找 Cloudflare Turnstile 的 iframe 并点击
+    // 策略 1: 通过 Playwright frame API 访问 iframe 内部点击复选框
+    try {
+      const tsFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+      const checkbox = tsFrame.locator('[type="checkbox"], label').first();
+      if (await checkbox.count() > 0) {
+        // 模拟人类移动鼠标到复选框
+        const box = await checkbox.boundingBox();
+        if (box) {
+          const cx = box.x + box.width / 2;
+          const cy = box.y + box.height / 2;
+          // 从远处移动到目标（人类行为）
+          await page.mouse.move(cx - 50, cy - 30);
+          await page.waitForTimeout(100 + Math.random() * 200);
+          await page.mouse.move(cx, cy, { steps: 5 });
+          await page.waitForTimeout(50 + Math.random() * 150);
+          await page.mouse.click(cx, cy, { delay: 30 });
+          logger.info(`已通过 frameLocator 点击 Turnstile 复选框 (${Math.round(cx)}, ${Math.round(cy)})`);
+        } else {
+          await checkbox.click({ force: true });
+          logger.info("已通过 force click 点击 Turnstile 复选框");
+        }
+      }
+    } catch (e) {
+      logger.warn(`frameLocator 方案失败: ${e.message}`);
+    }
+
+    // 策略 2: 通过 page.frames() 获取 iframe 内容帧
+    try {
+      for (const frame of page.frames()) {
+        const url = frame.url();
+        if (url.includes("challenges.cloudflare.com")) {
+          // 点击复选框
+          const cb = frame.locator('[type="checkbox"], [role="checkbox"]').first();
+          if (await cb.count() > 0) {
+            await cb.click({ timeout: 3000 });
+            logger.info("已通过 frame.click 点击 Turnstile");
+          }
+          // 也尝试点击 label（"Verify you are human"）
+          const label = frame.locator("label").first();
+          if (await label.count() > 0) {
+            try { await label.click({ timeout: 2000 }); } catch {}
+          }
+        }
+      }
+    } catch (e) {
+      logger.warn(`frame 方案失败: ${e.message}`);
+    }
+
+    // 策略 3: 坐标点击（兜底）
     try {
       const iframes = await page.$$("iframe");
       for (const iframe of iframes) {
@@ -326,32 +354,42 @@ async function handleTurnstile(page) {
         if (src && src.includes("challenges.cloudflare.com")) {
           const box = await iframe.boundingBox();
           if (box && box.width > 0 && box.height > 0) {
-            // 点击 iframe 中复选框区域（左侧约 30px 处）
-            await page.mouse.click(box.x + 30, box.y + box.height / 2);
-            logger.info(`已点击 Turnstile iframe (${Math.round(box.x + 30)}, ${Math.round(box.y + box.height / 2)})`);
+            const cx = box.x + 30;
+            const cy = box.y + box.height / 2;
+            await page.mouse.move(cx - 40, cy - 20);
+            await page.waitForTimeout(50);
+            await page.mouse.move(cx, cy, { steps: 5 });
+            await page.waitForTimeout(30);
+            await page.mouse.click(cx, cy);
+            logger.info(`已通过坐标点击 Turnstile iframe (${Math.round(cx)}, ${Math.round(cy)})`);
           }
         }
       }
     } catch (e) {
-      logger.warn(`Turnstile 点击异常: ${e.message}`);
+      logger.warn(`坐标点击方案失败: ${e.message}`);
     }
 
-    // 等待验证结果（最多 10 秒）
-    for (let w = 0; w < 20; w++) {
+    // 等待验证结果（最多 25 秒，Cloudflare 挑战可能需要较长时间）
+    logger.info(`等待 Cloudflare 验证完成（最多 25s）...`);
+    for (let w = 0; w < 50; w++) {
       await page.waitForTimeout(500);
       if (await page.evaluate(SOLVED_JS)) {
-        logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试）`);
+        logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试, ${((w + 1) * 0.5).toFixed(1)}s）`);
         return true;
       }
     }
 
-    logger.warn(`第 ${attempt + 1} 次未通过，重试...`);
-    // 重新展开（防止容器又缩回去了）
+    logger.warn(`第 ${attempt + 1} 次未通过（等待超时），重试...`);
     try { await page.evaluate(EXPAND_JS); } catch (e) { /* ignore */ }
+    // 每轮之间递增延迟
+    await page.waitForTimeout(2000 + attempt * 1000);
   }
 
-  logger.error("Turnstile 验证 6 次均失败");
-  await page.screenshot({ path: "turnstile_fail.png" }).catch(() => {});
+  logger.error("Turnstile 验证 4 次均失败");
+  try {
+    await page.screenshot({ path: "/tmp/turnstile_fail.png", fullPage: false });
+    logger.info("截图已保存到 /tmp/turnstile_fail.png");
+  } catch {}
   return false;
 }
 
