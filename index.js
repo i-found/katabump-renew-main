@@ -300,7 +300,7 @@ async function handleTurnstile(page) {
     // 打印 frame 内部 DOM 用于诊断
     try {
       const html = await tsFrame.content();
-      logger.info(`Turnstile frame HTML (前300字符): ${html.substring(0, 300)}`);
+      logger.info(`Turnstile frame HTML: ${html.substring(0, 600)}`);
     } catch (e) {
       logger.warn(`读取 frame HTML 失败: ${e.message}`);
     }
@@ -314,7 +314,7 @@ async function handleTurnstile(page) {
 
     logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 策略 1: 直接访问 cloudflare frame 内的 checkbox
+    // 策略 1: 直接访问 cloudflare frame 内的 checkbox（点击左侧 checkbox 区域）
     try {
       const frame = page.frame({ url: /challenges\.cloudflare\.com/ });
       if (frame) {
@@ -323,29 +323,39 @@ async function handleTurnstile(page) {
           'input[type="checkbox"]',
           ".cb-i",
           '[role="checkbox"]',
-          "label",
+          'label[for*="checkbox"]',
+          ".checkbox",
           "body",
         ];
+        let clicked = false;
         for (const sel of selectors) {
           const el = frame.locator(sel).first();
           const count = await el.count();
           if (count > 0) {
-            // 模拟人类鼠标移动到元素中心再点击
             const box = await el.boundingBox();
-            if (box) {
-              const cx = box.x + box.width / 2;
+            if (box && box.width > 0 && box.height > 0) {
+              // 复选框在元素左侧区域
+              const cx = box.x + Math.min(box.width / 2, 20);
               const cy = box.y + box.height / 2;
-              await page.mouse.move(cx - 30, cy - 20);
-              await page.waitForTimeout(100 + Math.random() * 200);
-              await page.mouse.move(cx, cy, { steps: 5 });
-              await page.waitForTimeout(30 + Math.random() * 120);
-              await page.mouse.click(cx, cy, { delay: 20 });
-              logger.success(`策略1: 点击了 frame 内 checkbox (${sel}) @ (${Math.round(cx)}, ${Math.round(cy)})`);
-            } else {
-              await el.click({ force: true });
-              logger.success(`策略1: force-click 了 frame 内元素 (${sel})`);
+              await page.mouse.move(cx - 20, cy - 15);
+              await page.waitForTimeout(80 + Math.random() * 150);
+              await page.mouse.move(cx, cy, { steps: 6 });
+              await page.waitForTimeout(30 + Math.random() * 100);
+              await page.mouse.click(cx, cy, { delay: 25 });
+              logger.success(`策略1: 点击 frame 内元素 (${sel}) @ (${Math.round(cx)}, ${Math.round(cy)})`);
+              clicked = true;
+              break;
             }
-            break;
+          }
+        }
+        if (!clicked) {
+          // 兜底：点击 frame body 左上角 checkbox 区域
+          const frameBox = await frame.locator("body").boundingBox();
+          if (frameBox) {
+            const cx = frameBox.x + 30;
+            const cy = frameBox.y + frameBox.height / 2;
+            await page.mouse.click(cx, cy);
+            logger.success(`策略1兜底: 点击 frame body @ (${Math.round(cx)}, ${Math.round(cy)})`);
           }
         }
       } else {
@@ -355,31 +365,36 @@ async function handleTurnstile(page) {
       logger.warn(`策略1 失败: ${e.message}`);
     }
 
-    // 策略 2: 点击主页面 .cf-turnstile 容器（触发 JS 渲染）
-    try {
-      const tsContainer = page.locator(".cf-turnstile").first();
-      if ((await tsContainer.count()) > 0) {
-        await tsContainer.click({ timeout: 5000 });
-        logger.success("策略2: 点击了 .cf-turnstile 容器");
-      }
-    } catch (e) {
-      logger.warn(`策略2 失败: ${e.message}`);
-    }
-
-    // 策略 3: 坐标点击（用 JS 获取 .cf-turnstile 容器的实际位置）
+    // 策略 2: 坐标点击主页面 .cf-turnstile 容器左侧（复选框所在位置）
     try {
       const coords = await page.evaluate(() => {
         const el = document.querySelector(".cf-turnstile");
         if (!el) return null;
         const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width, h: r.height };
+        // 复选框在容器左侧约 25px 处，垂直居中
+        return { x: r.x + 25, y: r.y + r.height / 2, w: r.width, h: r.height };
       });
       if (coords && coords.w > 0 && coords.h > 0) {
-        logger.info(`策略3: .cf-turnstile 位置 (${Math.round(coords.x)}, ${Math.round(coords.y)}) 尺寸 ${Math.round(coords.w)}x${Math.round(coords.h)}`);
+        logger.info(`策略2: .cf-turnstile 左侧位置 (${Math.round(coords.x)}, ${Math.round(coords.y)}) 尺寸 ${Math.round(coords.w)}x${Math.round(coords.h)}`);
+        await page.mouse.move(coords.x - 15, coords.y - 10);
+        await page.waitForTimeout(50);
+        await page.mouse.move(coords.x, coords.y, { steps: 4 });
+        await page.waitForTimeout(30);
         await page.mouse.click(coords.x, coords.y);
-        logger.success("策略3: 坐标点击 .cf-turnstile 完成");
+        logger.success("策略2: 坐标点击 .cf-turnstile 左侧完成");
       } else {
-        logger.warn("策略3: .cf-turnstile 容器尺寸为0或不可见");
+        logger.warn("策略2: .cf-turnstile 容器尺寸为0或不可见");
+      }
+    } catch (e) {
+      logger.warn(`策略2 失败: ${e.message}`);
+    }
+
+    // 策略 3: 点击主页面 .cf-turnstile 容器中心（兜底触发 JS）
+    try {
+      const tsContainer = page.locator(".cf-turnstile").first();
+      if ((await tsContainer.count()) > 0) {
+        await tsContainer.click({ timeout: 5000, position: { x: 25, y: 10 } });
+        logger.success("策略3: 点击了 .cf-turnstile 容器左侧");
       }
     } catch (e) {
       logger.warn(`策略3 失败: ${e.message}`);
