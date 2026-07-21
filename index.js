@@ -299,9 +299,17 @@ async function attemptTurnstileCdp(page) {
 // 浏览器启动 & 隐身配置（playwright-extra + stealth plugin）
 // ============================================================
 async function launchBrowser() {
-  logger.info("启动 Chromium 浏览器（xvfb 有头模式 + 隐身）...");
+  // 检测是否有可用的虚拟显示（Xvfb 提供的 DISPLAY）。
+  // 有显示则使用「有头模式」绕过 Cloudflare headless 检测；无显示则回退 headless，避免崩溃循环。
+  const hasDisplay = !!process.env.DISPLAY;
+  const headless = hasDisplay ? false : true;
+  logger.info(
+    `启动 Chromium 浏览器 (headless=${headless}${
+      hasDisplay ? `, DISPLAY=${process.env.DISPLAY}` : ", 无虚拟显示，回退 headless 模式"
+    } + 隐身)...`
+  );
   const browser = await chromium.launch({
-    headless: false, // 配合 xvfb 虚拟显示器，让浏览器以有头模式运行，绕过 Cloudflare headless 检测
+    headless, // 配合 xvfb 虚拟显示器以有头模式运行；缺失显示时回退 headless
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",

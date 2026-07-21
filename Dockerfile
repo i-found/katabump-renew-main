@@ -12,8 +12,11 @@ RUN apt-get update && apt-get install -y xvfb && rm -rf /var/lib/apt/lists/*
 # Copy application code
 COPY . .
 
+# 赋予启动脚本可执行权限
+RUN chmod +x start.sh
+
 # Railway injects PORT env var
 EXPOSE 3000
 
-# 用 xvfb-run 包裹 node，提供虚拟显示（1920x1080），Chrome 以有头模式运行
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "node", "index.js"]
+# 通过 start.sh 先拉起 Xvfb 虚拟显示，再运行 node（Chrome 以有头模式运行，绕过 Cloudflare headless 检测）
+CMD ["./start.sh"]
