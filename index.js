@@ -200,6 +200,102 @@ const ALTCHA_SOLVED_JS = `(() => {
 })()`;
 
 // ============================================================
+// Turnstile Shadow DOM Hook 注入脚本（核心：拦截 attachShadow 捕获 checkbox 坐标）
+// 参考原项目 i-found/katabump（renew.js）的 INJECTED_SCRIPT
+// ============================================================
+const INJECTED_SCRIPT = `
+(() => {
+  // 只在 iframe 中运行（Turnstile 通常在 iframe 里）
+  if (window.self === window.top) return;
+
+  // 模拟鼠标屏幕坐标，降低自动化检测概率
+  try {
+    function getRandomInt(min, max) {
+      return Math.floor(Math.random() * (max - min + 1)) + min;
+    }
+    const screenX = getRandomInt(800, 1200);
+    const screenY = getRandomInt(400, 600);
+    Object.defineProperty(MouseEvent.prototype, "screenX", { value: screenX });
+    Object.defineProperty(MouseEvent.prototype, "screenY", { value: screenY });
+  } catch (e) { /* ignore */ }
+
+  // Hook attachShadow：Turnstile 创建 Shadow DOM 时捕获 checkbox 位置
+  try {
+    const originalAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (init) {
+      const shadowRoot = originalAttachShadow.call(this, init);
+      if (shadowRoot) {
+        const checkAndReport = () => {
+          const checkbox = shadowRoot.querySelector('input[type="checkbox"]');
+          if (checkbox) {
+            const rect = checkbox.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
+              const xRatio = (rect.left + rect.width / 2) / window.innerWidth;
+              const yRatio = (rect.top + rect.height / 2) / window.innerHeight;
+              window.__turnstile_data = { xRatio, yRatio };
+              return true;
+            }
+          }
+          return false;
+        };
+        if (!checkAndReport()) {
+          const observer = new MutationObserver(() => {
+            if (checkAndReport()) observer.disconnect();
+          });
+          observer.observe(shadowRoot, { childList: true, subtree: true });
+        }
+      }
+      return shadowRoot;
+    };
+  } catch (e) { /* ignore */ }
+})();
+`;
+
+// ============================================================
+// CDP 原生鼠标点击（绕过自动化检测，参考原项目 attemptTurnstileCdp）
+// ============================================================
+async function attemptTurnstileCdp(page) {
+  const frames = page.frames();
+  for (const frame of frames) {
+    try {
+      const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
+      if (data) {
+        const iframeElement = await frame.frameElement();
+        if (!iframeElement) continue;
+        const box = await iframeElement.boundingBox();
+        if (!box) continue;
+
+        const clickX = box.x + box.width * data.xRatio;
+        const clickY = box.y + box.height * data.yRatio;
+        logger.info(`CDP 计算坐标: (${clickX.toFixed(1)}, ${clickY.toFixed(1)}) ratio=(${data.xRatio.toFixed(3)},${data.yRatio.toFixed(3)})`);
+
+        const client = await page.context().newCDPSession(page);
+        await client.send("Input.dispatchMouseEvent", {
+          type: "mousePressed",
+          x: clickX,
+          y: clickY,
+          button: "left",
+          clickCount: 1,
+        });
+        await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
+        await client.send("Input.dispatchMouseEvent", {
+          type: "mouseReleased",
+          x: clickX,
+          y: clickY,
+          button: "left",
+          clickCount: 1,
+        });
+        await client.detach();
+        return true;
+      }
+    } catch (e) {
+      /* 忽略跨域 frame 访问错误 */
+    }
+  }
+  return false;
+}
+
+// ============================================================
 // 浏览器启动 & 隐身配置（playwright-extra + stealth plugin）
 // ============================================================
 async function launchBrowser() {
@@ -240,6 +336,9 @@ async function launchBrowser() {
     });
   });
 
+  // 注入 Turnstile Shadow DOM Hook（捕获 checkbox 坐标供 CDP 点击）
+  await context.addInitScript(INJECTED_SCRIPT);
+
   const page = await context.newPage();
   return { browser, context, page };
 }
@@ -271,7 +370,7 @@ async function jsFillInput(page, selector, text) {
 }
 
 // ============================================================
-// 处理 Cloudflare Turnstile 验证（Shadow DOM 递归搜索版）
+// 处理 Cloudflare Turnstile 验证（重写版：精准访问 cloudflare frame）
 // ============================================================
 async function handleTurnstile(page) {
   logger.step("处理 Cloudflare Turnstile 验证...");
@@ -289,29 +388,6 @@ async function handleTurnstile(page) {
     await page.waitForTimeout(500);
   }
 
-  // 诊断：搜索页面及所有 Shadow DOM 中的 checkbox
-  const diag = await page.evaluate(() => {
-    function deepQuery(root, selector, found = []) {
-      try {
-        root.querySelectorAll("*").forEach((el) => {
-          if (el.matches && el.matches(selector)) found.push(el);
-          if (el.shadowRoot) deepQuery(el.shadowRoot, selector, found);
-        });
-      } catch (e) {}
-      return found;
-    }
-    const all = deepQuery(document, 'input[type="checkbox"], [role="checkbox"], .cb-i');
-    return all.map((el) => ({
-      tag: el.tagName,
-      cls: (el.className || "").toString().substring(0, 50),
-      role: el.getAttribute("role") || "",
-      inShadow: !!el.getRootNode().host,
-      w: el.offsetWidth,
-      h: el.offsetHeight,
-    }));
-  });
-  logger.info(`Shadow DOM 内找到 checkbox 类元素: ${JSON.stringify(diag)}`);
-
   for (let attempt = 0; attempt < 4; attempt++) {
     if (await page.evaluate(SOLVED_JS)) {
       logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试）`);
@@ -320,89 +396,25 @@ async function handleTurnstile(page) {
 
     logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 策略 1: 在 Shadow DOM 中递归查找并 JS 点击 checkbox
-    try {
-      const clicked = await page.evaluate(() => {
-        function deepQuery(root, selectors, found = []) {
-          try {
-            root.querySelectorAll("*").forEach((el) => {
-              for (const s of selectors) {
-                if (el.matches && el.matches(s) && el.offsetParent !== null) found.push(el);
-              }
-              if (el.shadowRoot) deepQuery(el.shadowRoot, selectors, found);
-            });
-          } catch (e) {}
-          return found;
-        }
-        const selectors = [
-          'input[type="checkbox"]',
-          '[role="checkbox"]',
-          ".cb-i",
-          ".cb-lb",
-          ".checkbox",
-        ];
-        const els = deepQuery(document, selectors);
-        for (const el of els) {
-          el.click();
-          return { ok: true, sel: el.tagName + "." + (el.className || "") };
-        }
-        return { ok: false };
-      });
-      if (clicked && clicked.ok) {
-        logger.success(`策略1: Shadow DOM 中 JS 点击了 (${clicked.sel})`);
-      } else {
-        logger.warn("策略1: Shadow DOM 中未找到可点击 checkbox");
-      }
-    } catch (e) {
-      logger.warn(`策略1 失败: ${e.message}`);
+    // 通过 CDP 注入原生鼠标点击（绕过自动化检测），最多轮询 15 次等待 checkbox 出现
+    let cdpClickResult = false;
+    for (let findAttempt = 0; findAttempt < 15; findAttempt++) {
+      cdpClickResult = await attemptTurnstileCdp(page);
+      if (cdpClickResult) break;
+      await page.waitForTimeout(1000);
     }
 
-    // 策略 2: Playwright locator 穿透 shadow DOM（新版 Playwright 支持 >> 语法）
-    try {
-      const tsLocator = page.locator(".cf-turnstile").locator("input[type='checkbox'], [role='checkbox'], .cb-i").first();
-      if ((await tsLocator.count()) > 0) {
-        const box = await tsLocator.boundingBox();
-        if (box) {
-          const cx = box.x + box.width / 2;
-          const cy = box.y + box.height / 2;
-          await page.mouse.move(cx - 20, cy - 15);
-          await page.waitForTimeout(80 + Math.random() * 150);
-          await page.mouse.move(cx, cy, { steps: 6 });
-          await page.waitForTimeout(30);
-          await page.mouse.click(cx, cy);
-          logger.success(`策略2: 坐标点击 shadow checkbox @ (${Math.round(cx)}, ${Math.round(cy)})`);
+    if (cdpClickResult) {
+      logger.info("CDP 点击已发送，等待 Cloudflare 验证（最多 12s）...");
+      for (let w = 0; w < 24; w++) {
+        await page.waitForTimeout(500);
+        if (await page.evaluate(SOLVED_JS)) {
+          logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试, ${((w + 1) * 0.5).toFixed(1)}s）`);
+          return true;
         }
-      } else {
-        logger.warn("策略2: locator 未找到 shadow checkbox");
       }
-    } catch (e) {
-      logger.warn(`策略2 失败: ${e.message}`);
-    }
-
-    // 策略 3: 坐标点击 .cf-turnstile 左侧（兜底）
-    try {
-      const coords = await page.evaluate(() => {
-        const el = document.querySelector(".cf-turnstile");
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { x: r.x + 25, y: r.y + r.height / 2, w: r.width, h: r.height };
-      });
-      if (coords && coords.w > 0) {
-        await page.mouse.click(coords.x, coords.y);
-        logger.success(`策略3: 坐标点击 .cf-turnstile 左侧 (${Math.round(coords.x)}, ${Math.round(coords.y)})`);
-      }
-    } catch (e) {
-      logger.warn(`策略3 失败: ${e.message}`);
-    }
-
-    // 等待验证结果（最多 25 秒）
-    logger.info(`等待 Cloudflare 验证完成（最多 25s）...`);
-    for (let w = 0; w < 50; w++) {
-      await page.waitForTimeout(500);
-      if (await page.evaluate(SOLVED_JS)) {
-        logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试, ${((w + 1) * 0.5).toFixed(1)}s）`);
-        return true;
-      }
+    } else {
+      logger.warn("未检测到 Turnstile checkbox（CDP 注入脚本未捕获）");
     }
 
     logger.warn(`第 ${attempt + 1} 次未通过（等待超时）`);
@@ -671,11 +683,27 @@ async function openRenewModal(page) {
   try {
     await page.waitForSelector("div.modal.show", { timeout: 5000 });
     logger.success("Renew 模态框已弹出");
-    return true;
   } catch {
     logger.warn("模态框未弹出");
     return false;
   }
+
+  // Renew 模态框内的 Turnstile 同样用 CDP 原生点击处理
+  logger.step("处理 Renew 模态框内 Turnstile...");
+  let cdpResult = false;
+  for (let findAttempt = 0; findAttempt < 20; findAttempt++) {
+    cdpResult = await attemptTurnstileCdp(page);
+    if (cdpResult) break;
+    await page.waitForTimeout(1000);
+  }
+  if (cdpResult) {
+    logger.info("Renew 模态框 Turnstile CDP 点击已发送，等待验证...");
+    await page.waitForTimeout(8000);
+  } else {
+    logger.warn("Renew 模态框未检测到 Turnstile（可能无需验证）");
+  }
+
+  return true;
 }
 
 /** 处理 ALTCHA 人机验证 */
