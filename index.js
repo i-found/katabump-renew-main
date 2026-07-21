@@ -299,9 +299,9 @@ async function attemptTurnstileCdp(page) {
 // 浏览器启动 & 隐身配置（playwright-extra + stealth plugin）
 // ============================================================
 async function launchBrowser() {
-  logger.info("启动 Chromium 浏览器（隐身模式）...");
+  logger.info("启动 Chromium 浏览器（xvfb 有头模式 + 隐身）...");
   const browser = await chromium.launch({
-    headless: true,
+    headless: false, // 配合 xvfb 虚拟显示器，让浏览器以有头模式运行，绕过 Cloudflare headless 检测
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -309,7 +309,6 @@ async function launchBrowser() {
       "--disable-blink-features=AutomationControlled",
       "--disable-features=IsolateOrigins,site-per-process",
       "--disable-web-security",
-      "--disable-gpu",
       "--window-size=1920,1080",
     ],
   });
