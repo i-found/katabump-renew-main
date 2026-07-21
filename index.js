@@ -271,7 +271,7 @@ async function jsFillInput(page, selector, text) {
 }
 
 // ============================================================
-// 处理 Cloudflare Turnstile 验证（改进版）
+// 处理 Cloudflare Turnstile 验证（重写版：多策略 + 调试日志）
 // ============================================================
 async function handleTurnstile(page) {
   logger.step("处理 Cloudflare Turnstile 验证...");
@@ -283,13 +283,30 @@ async function handleTurnstile(page) {
     return true;
   }
 
-  // 展开 Turnstile 容器
+  // 展开 Turnstile 容器 + 打印调试信息
   for (let i = 0; i < 3; i++) {
     try { await page.evaluate(EXPAND_JS); } catch (e) { /* ignore */ }
     await page.waitForTimeout(500);
   }
 
-  // 最多尝试 4 次（每次等待更长时间）
+  // 调试：列出页面上所有 iframe
+  const iframeInfo = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll("iframe")).map((f) => ({
+      src: (f.src || "").substring(0, 100),
+      width: f.offsetWidth,
+      height: f.offsetHeight,
+      visible: f.style.visibility !== "hidden" && f.style.display !== "none",
+    }));
+  });
+  logger.info(`页面上共 ${iframeInfo.length} 个 iframe: ${JSON.stringify(iframeInfo)}`);
+
+  // 调试：检查 .cf-turnstile 容器
+  const tsInfo = await page.evaluate(() => {
+    const el = document.querySelector(".cf-turnstile");
+    return el ? { tag: el.tagName, innerHTML: el.innerHTML.substring(0, 200) } : null;
+  });
+  logger.info(`.cf-turnstile 容器: ${JSON.stringify(tsInfo)}`);
+
   for (let attempt = 0; attempt < 4; attempt++) {
     if (await page.evaluate(SOLVED_JS)) {
       logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试）`);
@@ -298,78 +315,77 @@ async function handleTurnstile(page) {
 
     logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 策略 1: 通过 Playwright frame API 访问 iframe 内部点击复选框
+    // 策略 A: 用 frameLocator 点击 iframe 内的 checkbox
     try {
-      const tsFrame = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
-      const checkbox = tsFrame.locator('[type="checkbox"], label').first();
-      if (await checkbox.count() > 0) {
-        // 模拟人类移动鼠标到复选框
-        const box = await checkbox.boundingBox();
-        if (box) {
-          const cx = box.x + box.width / 2;
-          const cy = box.y + box.height / 2;
-          // 从远处移动到目标（人类行为）
-          await page.mouse.move(cx - 50, cy - 30);
-          await page.waitForTimeout(100 + Math.random() * 200);
-          await page.mouse.move(cx, cy, { steps: 5 });
-          await page.waitForTimeout(50 + Math.random() * 150);
-          await page.mouse.click(cx, cy, { delay: 30 });
-          logger.info(`已通过 frameLocator 点击 Turnstile 复选框 (${Math.round(cx)}, ${Math.round(cy)})`);
-        } else {
-          await checkbox.click({ force: true });
-          logger.info("已通过 force click 点击 Turnstile 复选框");
-        }
+      const locator = page.frameLocator('iframe[src*="challenges.cloudflare.com"]');
+      const cb = locator.locator('input[type="checkbox"], .cb-i, [role="checkbox"]').first();
+      const count = await cb.count();
+      logger.info(`策略A frameLocator checkbox 数量: ${count}`);
+      if (count > 0) {
+        await cb.click({ timeout: 5000, force: true });
+        logger.success("策略A: 通过 frameLocator 点击了 checkbox");
       }
     } catch (e) {
-      logger.warn(`frameLocator 方案失败: ${e.message}`);
+      logger.warn(`策略A 失败: ${e.message}`);
     }
 
-    // 策略 2: 通过 page.frames() 获取 iframe 内容帧
+    // 策略 B: 用 page.frames() 直接访问 iframe 内容
     try {
-      for (const frame of page.frames()) {
+      const allFrames = page.frames();
+      logger.info(`策略B 页面共 ${allFrames.length} 个 frame`);
+      for (const frame of allFrames) {
         const url = frame.url();
+        logger.info(`  frame: ${url.substring(0, 80)}`);
         if (url.includes("challenges.cloudflare.com")) {
-          // 点击复选框
-          const cb = frame.locator('[type="checkbox"], [role="checkbox"]').first();
-          if (await cb.count() > 0) {
-            await cb.click({ timeout: 3000 });
-            logger.info("已通过 frame.click 点击 Turnstile");
-          }
-          // 也尝试点击 label（"Verify you are human"）
-          const label = frame.locator("label").first();
-          if (await label.count() > 0) {
-            try { await label.click({ timeout: 2000 }); } catch {}
+          const body = await frame.locator("body").first();
+          if (await body.count() > 0) {
+            // 尝试点击 body（有时能触发验证）
+            await body.click({ timeout: 3000, position: { x: 30, y: 35 } });
+            logger.success("策略B: 点击了 Turnstile iframe body");
           }
         }
       }
     } catch (e) {
-      logger.warn(`frame 方案失败: ${e.message}`);
+      logger.warn(`策略B 失败: ${e.message}`);
     }
 
-    // 策略 3: 坐标点击（兜底）
+    // 策略 C: 点击主页面上的 .cf-turnstile 容器本身
     try {
-      const iframes = await page.$$("iframe");
-      for (const iframe of iframes) {
-        const src = await iframe.getAttribute("src");
-        if (src && src.includes("challenges.cloudflare.com")) {
-          const box = await iframe.boundingBox();
-          if (box && box.width > 0 && box.height > 0) {
-            const cx = box.x + 30;
-            const cy = box.y + box.height / 2;
-            await page.mouse.move(cx - 40, cy - 20);
-            await page.waitForTimeout(50);
-            await page.mouse.move(cx, cy, { steps: 5 });
-            await page.waitForTimeout(30);
-            await page.mouse.click(cx, cy);
-            logger.info(`已通过坐标点击 Turnstile iframe (${Math.round(cx)}, ${Math.round(cy)})`);
-          }
-        }
+      const tsContainer = page.locator(".cf-turnstile").first();
+      if ((await tsContainer.count()) > 0) {
+        await tsContainer.click({ timeout: 5000 });
+        logger.success("策略C: 点击了 .cf-turnstile 容器");
       }
     } catch (e) {
-      logger.warn(`坐标点击方案失败: ${e.message}`);
+      logger.warn(`策略C 失败: ${e.message}`);
     }
 
-    // 等待验证结果（最多 25 秒，Cloudflare 挑战可能需要较长时间）
+    // 策略 D: 坐标点击（用 JS 获取 iframe 位置）
+    try {
+      const coords = await page.evaluate(() => {
+        const iframes = document.querySelectorAll("iframe");
+        for (const f of iframes) {
+          if ((f.src || "").includes("cloudflare.com") || (f.src || "").includes("turnstile")) {
+            const r = f.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              return { x: r.x + 30, y: r.y + r.height / 2, w: r.width, h: r.height };
+            }
+          }
+        }
+        return null;
+      });
+      if (coords) {
+        logger.info(`策略D: iframe 位置 (${coords.x}, ${coords.y}) 尺寸 ${coords.w}x${coords.h}`);
+        await page.mouse.click(coords.x, coords.y);
+        logger.success("策略D: 坐标点击完成");
+      } else {
+        logger.warn("策略D: 未找到 cloudflare iframe");
+      }
+    } catch (e) {
+      logger.warn(`策略D 失败: ${e.message}`);
+    }
+
+    // 等待验证结果（最多 25 秒）
     logger.info(`等待 Cloudflare 验证完成（最多 25s）...`);
     for (let w = 0; w < 50; w++) {
       await page.waitForTimeout(500);
@@ -379,9 +395,8 @@ async function handleTurnstile(page) {
       }
     }
 
-    logger.warn(`第 ${attempt + 1} 次未通过（等待超时），重试...`);
+    logger.warn(`第 ${attempt + 1} 次未通过（等待超时）`);
     try { await page.evaluate(EXPAND_JS); } catch (e) { /* ignore */ }
-    // 每轮之间递增延迟
     await page.waitForTimeout(2000 + attempt * 1000);
   }
 
