@@ -297,10 +297,25 @@ async function handleTurnstile(page) {
   }
 
   if (tsFrame) {
-    // 打印 frame 内部 DOM 用于诊断
+    // 打印 frame 内部 DOM 用于诊断（完整 body）
     try {
-      const html = await tsFrame.content();
-      logger.info(`Turnstile frame HTML: ${html.substring(0, 600)}`);
+      const bodyHtml = await tsFrame.evaluate(() => document.body.innerHTML);
+      logger.info(`Turnstile frame body HTML: ${bodyHtml.substring(0, 800)}`);
+      // 列出所有可交互元素
+      const els = await tsFrame.evaluate(() => {
+        return Array.from(document.querySelectorAll("*"))
+          .filter(el => el.offsetWidth > 0 && el.offsetHeight > 0)
+          .slice(0, 30)
+          .map(el => ({
+            tag: el.tagName,
+            cls: (el.className || "").toString().substring(0, 40),
+            role: el.getAttribute("role") || "",
+            type: el.getAttribute("type") || "",
+            w: el.offsetWidth,
+            h: el.offsetHeight,
+          }));
+      });
+      logger.info(`Turnstile frame 元素: ${JSON.stringify(els)}`);
     } catch (e) {
       logger.warn(`读取 frame HTML 失败: ${e.message}`);
     }
@@ -314,48 +329,47 @@ async function handleTurnstile(page) {
 
     logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 策略 1: 直接访问 cloudflare frame 内的 checkbox（点击左侧 checkbox 区域）
+    // 策略 1: 直接访问 cloudflare frame 内的 checkbox（优先 JS 点击）
     try {
       const frame = page.frame({ url: /challenges\.cloudflare\.com/ });
       if (frame) {
-        // 尝试多个可能的 checkbox 选择器
-        const selectors = [
-          'input[type="checkbox"]',
-          ".cb-i",
-          '[role="checkbox"]',
-          'label[for*="checkbox"]',
-          ".checkbox",
-          "body",
-        ];
-        let clicked = false;
-        for (const sel of selectors) {
-          const el = frame.locator(sel).first();
-          const count = await el.count();
-          if (count > 0) {
-            const box = await el.boundingBox();
-            if (box && box.width > 0 && box.height > 0) {
-              // 复选框在元素左侧区域
-              const cx = box.x + Math.min(box.width / 2, 20);
-              const cy = box.y + box.height / 2;
-              await page.mouse.move(cx - 20, cy - 15);
-              await page.waitForTimeout(80 + Math.random() * 150);
-              await page.mouse.move(cx, cy, { steps: 6 });
-              await page.waitForTimeout(30 + Math.random() * 100);
-              await page.mouse.click(cx, cy, { delay: 25 });
-              logger.success(`策略1: 点击 frame 内元素 (${sel}) @ (${Math.round(cx)}, ${Math.round(cy)})`);
-              clicked = true;
-              break;
+        // 用 JS 在 frame 内查找并点击 checkbox
+        const clickedInfo = await frame.evaluate(() => {
+          const candidates = [
+            'input[type="checkbox"]',
+            '[role="checkbox"]',
+            ".cb-i",
+            ".checkbox",
+            'label[for*="checkbox"]',
+            ".cb-lb",
+            "#checkbox",
+          ];
+          for (const sel of candidates) {
+            const el = document.querySelector(sel);
+            if (el && el.offsetParent !== null) {
+              el.click();
+              return { sel, clicked: true, w: el.offsetWidth, h: el.offsetHeight };
             }
           }
-        }
-        if (!clicked) {
-          // 兜底：点击 frame body 左上角 checkbox 区域
+          // 兜底：找 body 内第一个可见的可点击元素
+          const clickable = document.querySelector('body *');
+          if (clickable) {
+            clickable.click();
+            return { sel: "first-child", clicked: true };
+          }
+          return { sel: null, clicked: false };
+        });
+        if (clickedInfo && clickedInfo.clicked) {
+          logger.success(`策略1: JS 点击了 frame 内元素 (${clickedInfo.sel})`);
+        } else {
+          logger.warn("策略1: JS 未找到可点击元素，改用坐标");
+          // 坐标点击 frame 内 checkbox 区域（左侧）
           const frameBox = await frame.locator("body").boundingBox();
           if (frameBox) {
             const cx = frameBox.x + 30;
             const cy = frameBox.y + frameBox.height / 2;
             await page.mouse.click(cx, cy);
-            logger.success(`策略1兜底: 点击 frame body @ (${Math.round(cx)}, ${Math.round(cy)})`);
+            logger.success(`策略1兜底: 坐标点击 frame @ (${Math.round(cx)}, ${Math.round(cy)})`);
           }
         }
       } else {
