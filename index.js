@@ -303,50 +303,54 @@ async function launchBrowser() {
   // 有显示则使用「有头模式」绕过 Cloudflare headless 检测；无显示则回退 headless，避免崩溃循环。
   const hasDisplay = !!process.env.DISPLAY;
   const headless = hasDisplay ? false : true;
+  const launchArgs = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-blink-features=AutomationControlled",
+    "--window-size=1920,1080",
+  ];
+
+  // 关键：使用真 Google Chrome（channel:"chrome"）而非 Playwright 内置 Chromium。
+  // Cloudflare 对内置 Chromium 内核识别能力极强，stealth 补不齐；真 Chrome 指纹才像真人。
   logger.info(
-    `启动 Chromium 浏览器 (headless=${headless}${
-      hasDisplay ? `, DISPLAY=${process.env.DISPLAY}` : ", 无虚拟显示，回退 headless 模式"
+    `启动浏览器 (真 Google Chrome 内核 channel=chrome, headless=${headless}${
+      hasDisplay ? `, DISPLAY=${process.env.DISPLAY}` : ", 无显示回退 headless"
     } + 隐身)...`
   );
-  const browser = await chromium.launch({
-    headless, // 配合 xvfb 虚拟显示器以有头模式运行；缺失显示时回退 headless
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-      "--disable-features=IsolateOrigins,site-per-process",
-      "--disable-web-security",
-      "--window-size=1920,1080",
-    ],
-  });
 
-  const context = await browser.newContext({
-    userAgent:
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    viewport: { width: 1920, height: 1080 },
-    locale: "en-US",
-    timezoneId: "Asia/Shanghai",
-    permissions: ["geolocation"],
-    geolocation: { latitude: 31.2304, longitude: 121.4737 }, // 上海坐标
-  });
-
-  // stealth plugin 已处理大部分指纹，这里补强 WebGL 和 hardwareConcurrency
-  await context.addInitScript(() => {
-    // 伪装硬件并发数
-    Object.defineProperty(navigator, "hardwareConcurrency", {
-      get: () => 8,
+  let context = null;
+  let browser = null;
+  try {
+    // 优先：持久化上下文（常驻浏览器配置/cookies，对齐参考项目 connectOverCDP 的常驻 Chrome）
+    context = await chromium.launchPersistentContext("/tmp/chrome-profile-katabump", {
+      channel: "chrome",
+      headless,
+      viewport: { width: 1920, height: 1080 },
+      locale: "en-US",
+      timezoneId: "Asia/Shanghai",
+      permissions: ["geolocation"],
+      geolocation: { latitude: 31.2304, longitude: 121.4737 }, // 上海坐标
+      args: launchArgs,
     });
-    // 伪装设备内存
-    Object.defineProperty(navigator, "deviceMemory", {
-      get: () => 8,
+  } catch (e) {
+    logger.warn(`launchPersistentContext 失败(${e.message})，回退普通 launch...`);
+    browser = await chromium.launch({ channel: "chrome", headless, args: launchArgs });
+    context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      locale: "en-US",
+      timezoneId: "Asia/Shanghai",
+      permissions: ["geolocation"],
+      geolocation: { latitude: 31.2304, longitude: 121.4737 },
     });
-  });
+  }
 
+  // 不覆盖 userAgent / hardwareConcurrency / deviceMemory：让真 Chrome 上报原生指纹，
+  // 避免 UA 与 userAgentData.brands 不一致被 Cloudflare 判定为伪造。
   // 注入 Turnstile Shadow DOM Hook（捕获 checkbox 坐标供 CDP 点击）
   await context.addInitScript(INJECTED_SCRIPT);
 
-  const page = await context.newPage();
+  const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
   return { browser, context, page };
 }
 
@@ -377,6 +381,25 @@ async function jsFillInput(page, selector, text) {
 }
 
 // ============================================================
+// 检测 Turnstile 是否已通过（双信号，对齐参考项目）
+// ============================================================
+async function isTurnstileSolved(page) {
+  // 信号1: cf-turnstile-response hidden input 被填充
+  try {
+    if (await page.evaluate(SOLVED_JS)) return true;
+  } catch (e) { /* ignore */ }
+  // 信号2: cloudflare frame 中出现 "Success!" 文本（参考项目的判定方式）
+  for (const f of page.frames()) {
+    if (f.url().includes("cloudflare")) {
+      try {
+        if (await f.getByText("Success!", { exact: false }).isVisible({ timeout: 300 })) return true;
+      } catch (e) { /* ignore */ }
+    }
+  }
+  return false;
+}
+
+// ============================================================
 // 处理 Cloudflare Turnstile 验证（重写版：精准访问 cloudflare frame）
 // ============================================================
 async function handleTurnstile(page) {
@@ -384,7 +407,7 @@ async function handleTurnstile(page) {
   await page.waitForTimeout(3000);
 
   // 检查是否已静默通过
-  if (await page.evaluate(SOLVED_JS)) {
+  if (await isTurnstileSolved(page)) {
     logger.success("Turnstile 已静默通过");
     return true;
   }
@@ -396,7 +419,7 @@ async function handleTurnstile(page) {
   }
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    if (await page.evaluate(SOLVED_JS)) {
+    if (await isTurnstileSolved(page)) {
       logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试）`);
       return true;
     }
@@ -415,7 +438,7 @@ async function handleTurnstile(page) {
       logger.info("CDP 点击已发送，等待 Cloudflare 验证（最多 12s）...");
       for (let w = 0; w < 24; w++) {
         await page.waitForTimeout(500);
-        if (await page.evaluate(SOLVED_JS)) {
+        if (await isTurnstileSolved(page)) {
           logger.success(`Turnstile 通过（第 ${attempt + 1} 次尝试, ${((w + 1) * 0.5).toFixed(1)}s）`);
           return true;
         }

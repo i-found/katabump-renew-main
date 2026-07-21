@@ -9,11 +9,14 @@ RUN npm install --omit=dev
 # 安装 xvfb 虚拟显示器：让 Chrome 以「有头模式」运行，绕过 Cloudflare 对 headless 的检测
 RUN apt-get update && apt-get install -y xvfb && rm -rf /var/lib/apt/lists/*
 
+# 安装真 Google Chrome（playwright 的 chrome channel）：真内核指纹比内置 Chromium 更难被 Cloudflare 识别
+RUN npx playwright install --with-deps chrome
+
 # Copy application code
 COPY . .
 
-# 赋予启动脚本可执行权限
-RUN chmod +x start.sh
+# 修正 Windows 换行符并赋予启动脚本可执行权限
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 # Railway injects PORT env var
 EXPOSE 3000
