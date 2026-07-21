@@ -271,7 +271,7 @@ async function jsFillInput(page, selector, text) {
 }
 
 // ============================================================
-// 处理 Cloudflare Turnstile 验证（重写版：精准访问 cloudflare frame）
+// 处理 Cloudflare Turnstile 验证（Shadow DOM 递归搜索版）
 // ============================================================
 async function handleTurnstile(page) {
   logger.step("处理 Cloudflare Turnstile 验证...");
@@ -289,37 +289,28 @@ async function handleTurnstile(page) {
     await page.waitForTimeout(500);
   }
 
-  // 查找 challenges.cloudflare.com frame
-  const tsFrame = page.frame({ url: /challenges\.cloudflare\.com/ });
-  if (!tsFrame) {
-    logger.warn("未找到 challenges.cloudflare.com frame，尝试等待 iframe 加载...");
-    await page.waitForTimeout(3000);
-  }
-
-  if (tsFrame) {
-    // 打印 frame 内部 DOM 用于诊断（完整 body）
-    try {
-      const bodyHtml = await tsFrame.evaluate(() => document.body.innerHTML);
-      logger.info(`Turnstile frame body HTML: ${bodyHtml.substring(0, 800)}`);
-      // 列出所有可交互元素
-      const els = await tsFrame.evaluate(() => {
-        return Array.from(document.querySelectorAll("*"))
-          .filter(el => el.offsetWidth > 0 && el.offsetHeight > 0)
-          .slice(0, 30)
-          .map(el => ({
-            tag: el.tagName,
-            cls: (el.className || "").toString().substring(0, 40),
-            role: el.getAttribute("role") || "",
-            type: el.getAttribute("type") || "",
-            w: el.offsetWidth,
-            h: el.offsetHeight,
-          }));
-      });
-      logger.info(`Turnstile frame 元素: ${JSON.stringify(els)}`);
-    } catch (e) {
-      logger.warn(`读取 frame HTML 失败: ${e.message}`);
+  // 诊断：搜索页面及所有 Shadow DOM 中的 checkbox
+  const diag = await page.evaluate(() => {
+    function deepQuery(root, selector, found = []) {
+      try {
+        root.querySelectorAll("*").forEach((el) => {
+          if (el.matches && el.matches(selector)) found.push(el);
+          if (el.shadowRoot) deepQuery(el.shadowRoot, selector, found);
+        });
+      } catch (e) {}
+      return found;
     }
-  }
+    const all = deepQuery(document, 'input[type="checkbox"], [role="checkbox"], .cb-i');
+    return all.map((el) => ({
+      tag: el.tagName,
+      cls: (el.className || "").toString().substring(0, 50),
+      role: el.getAttribute("role") || "",
+      inShadow: !!el.getRootNode().host,
+      w: el.offsetWidth,
+      h: el.offsetHeight,
+    }));
+  });
+  logger.info(`Shadow DOM 内找到 checkbox 类元素: ${JSON.stringify(diag)}`);
 
   for (let attempt = 0; attempt < 4; attempt++) {
     if (await page.evaluate(SOLVED_JS)) {
@@ -329,86 +320,76 @@ async function handleTurnstile(page) {
 
     logger.info(`第 ${attempt + 1} 次尝试解决 Turnstile...`);
 
-    // 策略 1: 直接访问 cloudflare frame 内的 checkbox（优先 JS 点击）
+    // 策略 1: 在 Shadow DOM 中递归查找并 JS 点击 checkbox
     try {
-      const frame = page.frame({ url: /challenges\.cloudflare\.com/ });
-      if (frame) {
-        // 用 JS 在 frame 内查找并点击 checkbox
-        const clickedInfo = await frame.evaluate(() => {
-          const candidates = [
-            'input[type="checkbox"]',
-            '[role="checkbox"]',
-            ".cb-i",
-            ".checkbox",
-            'label[for*="checkbox"]',
-            ".cb-lb",
-            "#checkbox",
-          ];
-          for (const sel of candidates) {
-            const el = document.querySelector(sel);
-            if (el && el.offsetParent !== null) {
-              el.click();
-              return { sel, clicked: true, w: el.offsetWidth, h: el.offsetHeight };
-            }
-          }
-          // 兜底：找 body 内第一个可见的可点击元素
-          const clickable = document.querySelector('body *');
-          if (clickable) {
-            clickable.click();
-            return { sel: "first-child", clicked: true };
-          }
-          return { sel: null, clicked: false };
-        });
-        if (clickedInfo && clickedInfo.clicked) {
-          logger.success(`策略1: JS 点击了 frame 内元素 (${clickedInfo.sel})`);
-        } else {
-          logger.warn("策略1: JS 未找到可点击元素，改用坐标");
-          // 坐标点击 frame 内 checkbox 区域（左侧）
-          const frameBox = await frame.locator("body").boundingBox();
-          if (frameBox) {
-            const cx = frameBox.x + 30;
-            const cy = frameBox.y + frameBox.height / 2;
-            await page.mouse.click(cx, cy);
-            logger.success(`策略1兜底: 坐标点击 frame @ (${Math.round(cx)}, ${Math.round(cy)})`);
-          }
+      const clicked = await page.evaluate(() => {
+        function deepQuery(root, selectors, found = []) {
+          try {
+            root.querySelectorAll("*").forEach((el) => {
+              for (const s of selectors) {
+                if (el.matches && el.matches(s) && el.offsetParent !== null) found.push(el);
+              }
+              if (el.shadowRoot) deepQuery(el.shadowRoot, selectors, found);
+            });
+          } catch (e) {}
+          return found;
         }
+        const selectors = [
+          'input[type="checkbox"]',
+          '[role="checkbox"]',
+          ".cb-i",
+          ".cb-lb",
+          ".checkbox",
+        ];
+        const els = deepQuery(document, selectors);
+        for (const el of els) {
+          el.click();
+          return { ok: true, sel: el.tagName + "." + (el.className || "") };
+        }
+        return { ok: false };
+      });
+      if (clicked && clicked.ok) {
+        logger.success(`策略1: Shadow DOM 中 JS 点击了 (${clicked.sel})`);
       } else {
-        logger.warn("策略1: 未找到 cloudflare frame");
+        logger.warn("策略1: Shadow DOM 中未找到可点击 checkbox");
       }
     } catch (e) {
       logger.warn(`策略1 失败: ${e.message}`);
     }
 
-    // 策略 2: 坐标点击主页面 .cf-turnstile 容器左侧（复选框所在位置）
+    // 策略 2: Playwright locator 穿透 shadow DOM（新版 Playwright 支持 >> 语法）
     try {
-      const coords = await page.evaluate(() => {
-        const el = document.querySelector(".cf-turnstile");
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        // 复选框在容器左侧约 25px 处，垂直居中
-        return { x: r.x + 25, y: r.y + r.height / 2, w: r.width, h: r.height };
-      });
-      if (coords && coords.w > 0 && coords.h > 0) {
-        logger.info(`策略2: .cf-turnstile 左侧位置 (${Math.round(coords.x)}, ${Math.round(coords.y)}) 尺寸 ${Math.round(coords.w)}x${Math.round(coords.h)}`);
-        await page.mouse.move(coords.x - 15, coords.y - 10);
-        await page.waitForTimeout(50);
-        await page.mouse.move(coords.x, coords.y, { steps: 4 });
-        await page.waitForTimeout(30);
-        await page.mouse.click(coords.x, coords.y);
-        logger.success("策略2: 坐标点击 .cf-turnstile 左侧完成");
+      const tsLocator = page.locator(".cf-turnstile").locator("input[type='checkbox'], [role='checkbox'], .cb-i").first();
+      if ((await tsLocator.count()) > 0) {
+        const box = await tsLocator.boundingBox();
+        if (box) {
+          const cx = box.x + box.width / 2;
+          const cy = box.y + box.height / 2;
+          await page.mouse.move(cx - 20, cy - 15);
+          await page.waitForTimeout(80 + Math.random() * 150);
+          await page.mouse.move(cx, cy, { steps: 6 });
+          await page.waitForTimeout(30);
+          await page.mouse.click(cx, cy);
+          logger.success(`策略2: 坐标点击 shadow checkbox @ (${Math.round(cx)}, ${Math.round(cy)})`);
+        }
       } else {
-        logger.warn("策略2: .cf-turnstile 容器尺寸为0或不可见");
+        logger.warn("策略2: locator 未找到 shadow checkbox");
       }
     } catch (e) {
       logger.warn(`策略2 失败: ${e.message}`);
     }
 
-    // 策略 3: 点击主页面 .cf-turnstile 容器中心（兜底触发 JS）
+    // 策略 3: 坐标点击 .cf-turnstile 左侧（兜底）
     try {
-      const tsContainer = page.locator(".cf-turnstile").first();
-      if ((await tsContainer.count()) > 0) {
-        await tsContainer.click({ timeout: 5000, position: { x: 25, y: 10 } });
-        logger.success("策略3: 点击了 .cf-turnstile 容器左侧");
+      const coords = await page.evaluate(() => {
+        const el = document.querySelector(".cf-turnstile");
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return { x: r.x + 25, y: r.y + r.height / 2, w: r.width, h: r.height };
+      });
+      if (coords && coords.w > 0) {
+        await page.mouse.click(coords.x, coords.y);
+        logger.success(`策略3: 坐标点击 .cf-turnstile 左侧 (${Math.round(coords.x)}, ${Math.round(coords.y)})`);
       }
     } catch (e) {
       logger.warn(`策略3 失败: ${e.message}`);
